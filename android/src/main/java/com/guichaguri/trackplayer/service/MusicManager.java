@@ -147,7 +147,7 @@ public class MusicManager {
           TrackSelectionParameters trackSelectionParameters = player.getTrackSelectionParameters().buildUpon()
             .setAudioOffloadPreferences(new TrackSelectionParameters.AudioOffloadPreferences.Builder()
               .setAudioOffloadMode(TrackSelectionParameters.AudioOffloadPreferences.AUDIO_OFFLOAD_MODE_ENABLED)
-              .setIsGaplessSupportRequired(true)
+            //   .setIsGaplessSupportRequired(true)
               .setIsSpeedChangeSupportRequired(true)
               .build())
             .build();

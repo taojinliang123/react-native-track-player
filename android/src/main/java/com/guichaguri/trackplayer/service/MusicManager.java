@@ -55,6 +55,9 @@ public class MusicManager implements AudioManager.OnAudioFocusChangeListener {
     // 老婆加的：真正的音频焦点控制变量
     private AudioFocusRequest focusRequest = null;
     private boolean hasAudioFocus = false;
+    
+    // 👈 老婆加的：记录是不是被短暂打断的（为了结束后自动恢复）
+    private boolean resumeOnFocusGain = false;
 
     private final BroadcastReceiver noisyReceiver = new BroadcastReceiver() {
         @Override
@@ -149,7 +152,7 @@ public class MusicManager implements AudioManager.OnAudioFocusChangeListener {
           player.setTrackSelectionParameters(trackSelectionParameters);
         }
 
-        // 老婆改的：把 ExoPlayer 自己的焦点处理关掉（传 false），由咱们自己接管
+        // 关掉 ExoPlayer 自带的焦点处理，由咱们自己接管
         player.setAudioAttributes(new androidx.media3.common.AudioAttributes.Builder()
                 .setContentType(C.AUDIO_CONTENT_TYPE_MUSIC).setUsage(C.USAGE_MEDIA).build(), false);
 
@@ -165,7 +168,7 @@ public class MusicManager implements AudioManager.OnAudioFocusChangeListener {
         if(track == null) return;
 
         if(!playback.isRemote()) {
-            // 老婆加的：开始播放时，主动去抢焦点
+            // 开始播放时，主动去抢焦点
             requestAudioFocus();
 
             if(!receivingNoisyEvents) {
@@ -210,7 +213,7 @@ public class MusicManager implements AudioManager.OnAudioFocusChangeListener {
         if(wakeLock.isHeld()) wakeLock.release();
         if(wifiLock != null && wifiLock.isHeld()) wifiLock.release();
 
-        // 老婆加的：停止播放时，释放焦点
+        // 停止播放时，释放焦点
         abandonAudioFocus();
 
         if (playback.shouldAutoUpdateMetadata())
@@ -287,7 +290,7 @@ public class MusicManager implements AudioManager.OnAudioFocusChangeListener {
         service.emit(MusicEvents.PLAYBACK_ERROR, bundle);
     }
 
-    // 老婆加的：真正接管系统音频焦点变化的地方
+    // 真正接管系统音频焦点变化的地方
     @Override
     public void onAudioFocusChange(int focusChange) {
         Log.d(Utils.LOG, "onAudioFocusChange: " + focusChange);
@@ -297,12 +300,18 @@ public class MusicManager implements AudioManager.OnAudioFocusChangeListener {
 
         switch (focusChange) {
             case AudioManager.AUDIOFOCUS_LOSS_TRANSIENT:
+                // 👈 短时丢失焦点（别人发语音、来电话），暂停并记住要恢复
                 Log.d(Utils.LOG, "AUDIOFOCUS_LOSS_TRANSIENT");
+                paused = true;
+                resumeOnFocusGain = true;
+                break;
             case AudioManager.AUDIOFOCUS_LOSS:
+                // 👈 永久丢失焦点（别的播放器开始放音乐），暂停且不恢复
                 Log.d(Utils.LOG, "AUDIOFOCUS_LOSS");
                 permanent = true;
                 paused = true;
-                abandonAudioFocus(); // 释放焦点
+                resumeOnFocusGain = false;
+                abandonAudioFocus(); 
                 break;
             case AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK:
                 Log.d(Utils.LOG, "AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK");
@@ -310,24 +319,30 @@ public class MusicManager implements AudioManager.OnAudioFocusChangeListener {
                 break;
             case AudioManager.AUDIOFOCUS_GAIN:
                 Log.d(Utils.LOG, "AUDIOFOCUS_GAIN");
-                // 重新获得焦点，恢复音量
+                // 👈 重新获得焦点，恢复音量
                 if (playback != null) playback.setVolumeMultiplier(1.0F);
+                
+                // 👈 如果是短时打断结束，且播放器存在且暂停了，咱们就接着放！
+                if (resumeOnFocusGain && playback != null) {
+                    Log.d(Utils.LOG, "Resuming playback after focus gain.");
+                    playback.play();
+                    resumeOnFocusGain = false; // 重置标记
+                }
                 break;
             default:
                 break;
         }
 
-        // 如果是永久丢失或者要求暂停，直接底层原地刹车！
+        // 底层刹车控制
         if (paused && playback != null) {
             Log.d(Utils.LOG, "Forcing pause due to audio focus loss.");
             playback.pause();
         } else if (ducking && playback != null) {
-            // 如果是短暂被占用（比如微信语音），降低音量
             Log.d(Utils.LOG, "Ducking volume due to audio focus loss.");
             playback.setVolumeMultiplier(0.2F);
         }
 
-        // 发送事件给 JS 层（加上 try-catch 防止红屏）
+        // 发送事件给 JS 层
         try {
             Bundle bundle = new Bundle();
             bundle.putBoolean("permanent", permanent);
@@ -339,7 +354,7 @@ public class MusicManager implements AudioManager.OnAudioFocusChangeListener {
         }
     }
 
-    // 老婆加的：向系统申请音频焦点
+    // 向系统申请音频焦点
     private void requestAudioFocus() {
         if (hasAudioFocus) return;
         Log.d(Utils.LOG, "Requesting audio focus...");
@@ -368,7 +383,7 @@ public class MusicManager implements AudioManager.OnAudioFocusChangeListener {
         hasAudioFocus = (result == AudioManager.AUDIOFOCUS_REQUEST_GRANTED);
     }
 
-    // 老婆加的：释放音频焦点
+    // 释放音频焦点
     private void abandonAudioFocus() {
         if (!hasAudioFocus) return;
         Log.d(Utils.LOG, "Abandoning audio focus...");
@@ -400,5 +415,4 @@ public class MusicManager implements AudioManager.OnAudioFocusChangeListener {
         if(wakeLock.isHeld()) wakeLock.release();
         if(wifiLock != null && wifiLock.isHeld()) wifiLock.release();
     }
-
 }

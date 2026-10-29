@@ -58,6 +58,9 @@ public class MusicManager implements AudioManager.OnAudioFocusChangeListener {
     
     // 👈 老婆加的：记录是不是被短暂打断的（为了结束后自动恢复）
     private boolean resumeOnFocusGain = false;
+    
+    // 👈 老婆加的：接收前端的开关信号
+    private boolean shouldHandleAudioFocus = true; 
 
     private final BroadcastReceiver noisyReceiver = new BroadcastReceiver() {
         @Override
@@ -121,7 +124,10 @@ public class MusicManager implements AudioManager.OnAudioFocusChangeListener {
 
     public LocalPlayback createLocalPlayback(Bundle options) {
         boolean autoUpdateMetadata = options.getBoolean("autoUpdateMetadata", true);
-        boolean shouldHandleAudioFocus = options.getBoolean("handleAudioFocus", true);
+        
+        // 👈 老婆改的：这里读取前端传过来的开关状态，并保存为类变量
+        this.shouldHandleAudioFocus = options.getBoolean("handleAudioFocus", true);
+        
         boolean shouldEnableAudioOffload = options.getBoolean("audioOffload", true);
         int minBuffer = (int)Utils.toMillis(options.getDouble("minBuffer", Utils.toSeconds(DEFAULT_MIN_BUFFER_MS)));
         int maxBuffer = (int)Utils.toMillis(options.getDouble("maxBuffer", Utils.toSeconds(DEFAULT_MAX_BUFFER_MS)));
@@ -168,8 +174,10 @@ public class MusicManager implements AudioManager.OnAudioFocusChangeListener {
         if(track == null) return;
 
         if(!playback.isRemote()) {
-            // 开始播放时，主动去抢焦点
-            requestAudioFocus();
+            // 👈 老婆改的：只有开关打开了，才去抢焦点
+            if (shouldHandleAudioFocus) {
+                requestAudioFocus();
+            }
 
             if(!receivingNoisyEvents) {
                 receivingNoisyEvents = true;
@@ -293,6 +301,9 @@ public class MusicManager implements AudioManager.OnAudioFocusChangeListener {
     // 真正接管系统音频焦点变化的地方
     @Override
     public void onAudioFocusChange(int focusChange) {
+        // 👈 老婆改的：如果开关关着，直接无视系统的任何焦点变化
+        if (!shouldHandleAudioFocus) return;
+
         Log.d(Utils.LOG, "onAudioFocusChange: " + focusChange);
         boolean permanent = false;
         boolean paused = false;
@@ -300,13 +311,11 @@ public class MusicManager implements AudioManager.OnAudioFocusChangeListener {
 
         switch (focusChange) {
             case AudioManager.AUDIOFOCUS_LOSS_TRANSIENT:
-                // 👈 短时丢失焦点（别人发语音、来电话），暂停并记住要恢复
                 Log.d(Utils.LOG, "AUDIOFOCUS_LOSS_TRANSIENT");
                 paused = true;
                 resumeOnFocusGain = true;
                 break;
             case AudioManager.AUDIOFOCUS_LOSS:
-                // 👈 永久丢失焦点（别的播放器开始放音乐），暂停且不恢复
                 Log.d(Utils.LOG, "AUDIOFOCUS_LOSS");
                 permanent = true;
                 paused = true;
@@ -319,21 +328,17 @@ public class MusicManager implements AudioManager.OnAudioFocusChangeListener {
                 break;
             case AudioManager.AUDIOFOCUS_GAIN:
                 Log.d(Utils.LOG, "AUDIOFOCUS_GAIN");
-                // 👈 重新获得焦点，恢复音量
                 if (playback != null) playback.setVolumeMultiplier(1.0F);
-                
-                // 👈 如果是短时打断结束，且播放器存在且暂停了，咱们就接着放！
                 if (resumeOnFocusGain && playback != null) {
                     Log.d(Utils.LOG, "Resuming playback after focus gain.");
                     playback.play();
-                    resumeOnFocusGain = false; // 重置标记
+                    resumeOnFocusGain = false; 
                 }
                 break;
             default:
                 break;
         }
 
-        // 底层刹车控制
         if (paused && playback != null) {
             Log.d(Utils.LOG, "Forcing pause due to audio focus loss.");
             playback.pause();
@@ -342,7 +347,6 @@ public class MusicManager implements AudioManager.OnAudioFocusChangeListener {
             playback.setVolumeMultiplier(0.2F);
         }
 
-        // 发送事件给 JS 层
         try {
             Bundle bundle = new Bundle();
             bundle.putBoolean("permanent", permanent);

@@ -309,12 +309,23 @@ public class MusicManager {
     }
 
     public void onAudioFocusChange(boolean permanent, boolean paused, boolean ducking) {
-        Bundle bundle = new Bundle();
-        bundle.putBoolean("permanent", permanent);
-        bundle.putBoolean("paused", paused);
-        bundle.putBoolean("ducking", ducking);
-        // Log.e(Utils.LOG, "permanent： " + permanent + "  paused: " + paused + "  ducking: " + ducking);
-        service.emit(MusicEvents.BUTTON_DUCK, bundle);
+        // 🚨 老婆加的保命代码：如果底层告诉咱们焦点丢了（paused = true），直接原地暂停！
+        if (paused && playback != null) {
+            Log.d(Utils.LOG, "AudioFocus loss detected, forcing pause.");
+            playback.pause();
+        }
+
+        // 原来的 JS 事件发送逻辑，外面包裹一层 try-catch 防止红屏
+        try {
+            Bundle bundle = new Bundle();
+            bundle.putBoolean("permanent", permanent);
+            bundle.putBoolean("paused", paused);
+            bundle.putBoolean("ducking", ducking);
+            // Log.e(Utils.LOG, "permanent： " + permanent + "  paused: " + paused + "  ducking: " + ducking);
+            service.emit(MusicEvents.BUTTON_DUCK, bundle);
+        } catch (Exception e) {
+            Log.e(Utils.LOG, "Error emitting BUTTON_DUCK event: " + e.getMessage());
+        }
     }
 
     /* @Override

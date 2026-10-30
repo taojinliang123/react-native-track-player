@@ -12,12 +12,9 @@ import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
-import android.media.AudioAttributes;
-import android.media.AudioFocusRequest;
 import android.media.AudioManager;
 import android.net.wifi.WifiManager;
 import android.net.wifi.WifiManager.WifiLock;
-import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.PowerManager;
@@ -42,7 +39,7 @@ import com.guichaguri.trackplayer.service.player.LocalPlayback;
  * @author Guichaguri
  */
 @UnstableApi
-public class MusicManager implements AudioManager.OnAudioFocusChangeListener {
+public class MusicManager {
 
     private final MusicService service;
 
@@ -52,15 +49,10 @@ public class MusicManager implements AudioManager.OnAudioFocusChangeListener {
     private final MetadataManager metadata;
     private ExoPlayback playback;
 
-    // 老婆加的：真正的音频焦点控制变量
-    private AudioFocusRequest focusRequest = null;
-    private boolean hasAudioFocus = false;
-    
-    // 👈 老婆加的：记录是不是被短暂打断的（为了结束后自动恢复）
-    private boolean resumeOnFocusGain = false;
-    
-    // 👈 老婆加的：接收前端的开关信号
-    private boolean shouldHandleAudioFocus = true; 
+    // @RequiresApi(26)
+    // private AudioFocusRequest focus = null;
+    // private boolean hasAudioFocus = false;
+    // private boolean wasDucking = false;
 
     private final BroadcastReceiver noisyReceiver = new BroadcastReceiver() {
         @Override
@@ -71,6 +63,7 @@ public class MusicManager implements AudioManager.OnAudioFocusChangeListener {
     private boolean receivingNoisyEvents = false;
 
     private boolean stopWithApp = false;
+    // private boolean alwaysPauseOnInterruption = false;
     private String playState = null;
 
     @SuppressLint("InvalidWakeLockTag")
@@ -82,6 +75,7 @@ public class MusicManager implements AudioManager.OnAudioFocusChangeListener {
         wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "track-player-wake-lock");
         wakeLock.setReferenceCounted(false);
 
+        // Android 7: Use the application context here to prevent any memory leaks
         WifiManager wifiManager = (WifiManager)service.getApplicationContext().getSystemService(Context.WIFI_SERVICE);
         if (wifiManager != null) {
             wifiLock = wifiManager.createWifiLock(WifiManager.WIFI_MODE_FULL, "track-player-wifi-lock");
@@ -100,6 +94,10 @@ public class MusicManager implements AudioManager.OnAudioFocusChangeListener {
     public void setStopWithApp(boolean stopWithApp) {
         this.stopWithApp = stopWithApp;
     }
+
+    // public void setAlwaysPauseOnInterruption(boolean alwaysPauseOnInterruption) {
+    //     this.alwaysPauseOnInterruption = alwaysPauseOnInterruption;
+    // }
 
     public MetadataManager getMetadata() {
         return metadata;
@@ -124,10 +122,7 @@ public class MusicManager implements AudioManager.OnAudioFocusChangeListener {
 
     public LocalPlayback createLocalPlayback(Bundle options) {
         boolean autoUpdateMetadata = options.getBoolean("autoUpdateMetadata", true);
-        
-        // 👈 老婆改的：这里读取前端传过来的开关状态，并保存为类变量
-        this.shouldHandleAudioFocus = options.getBoolean("handleAudioFocus", true);
-        
+        boolean shouldHandleAudioFocus = options.getBoolean("handleAudioFocus", true);
         boolean shouldEnableAudioOffload = options.getBoolean("audioOffload", true);
         int minBuffer = (int)Utils.toMillis(options.getDouble("minBuffer", Utils.toSeconds(DEFAULT_MIN_BUFFER_MS)));
         int maxBuffer = (int)Utils.toMillis(options.getDouble("maxBuffer", Utils.toSeconds(DEFAULT_MAX_BUFFER_MS)));
@@ -152,15 +147,28 @@ public class MusicManager implements AudioManager.OnAudioFocusChangeListener {
           TrackSelectionParameters trackSelectionParameters = player.getTrackSelectionParameters().buildUpon()
             .setAudioOffloadPreferences(new TrackSelectionParameters.AudioOffloadPreferences.Builder()
               .setAudioOffloadMode(TrackSelectionParameters.AudioOffloadPreferences.AUDIO_OFFLOAD_MODE_ENABLED)
+            //   .setIsGaplessSupportRequired(true)
               .setIsSpeedChangeSupportRequired(true)
               .build())
             .build();
           player.setTrackSelectionParameters(trackSelectionParameters);
+          // player.addAudioOffloadListener(new ExoPlayer.AudioOffloadListener() {
+          //     @Override
+          //     public void onSleepingForOffloadChanged(boolean isSleepingForOffload) {
+          //         Log.d(Utils.LOG, "onSleepingForOffloadChanged: " + isSleepingForOffload);
+          //     }
+
+          //     @Override
+          //     public void onOffloadedPlayback(boolean isOffloadedPlayback) {
+          //         Log.d(Utils.LOG, "onOffloadedPlayback: " + isOffloadedPlayback);
+          //     }
+          // });
         }
 
-        // 关掉 ExoPlayer 自带的焦点处理，由咱们自己接管
+        // player.addAnalyticsListener(new EventLogger(null));
+
         player.setAudioAttributes(new androidx.media3.common.AudioAttributes.Builder()
-                .setContentType(C.AUDIO_CONTENT_TYPE_MUSIC).setUsage(C.USAGE_MEDIA).build(), false);
+                .setContentType(C.AUDIO_CONTENT_TYPE_MUSIC).setUsage(C.USAGE_MEDIA).build(), shouldHandleAudioFocus);
 
         return new LocalPlayback(service, this, player, cacheMaxSize, autoUpdateMetadata);
     }
@@ -174,10 +182,7 @@ public class MusicManager implements AudioManager.OnAudioFocusChangeListener {
         if(track == null) return;
 
         if(!playback.isRemote()) {
-            // 👈 老婆改的：只有开关打开了，才去抢焦点
-            if (shouldHandleAudioFocus) {
-                requestAudioFocus();
-            }
+            // requestFocus();
 
             if(!receivingNoisyEvents) {
                 receivingNoisyEvents = true;
@@ -198,11 +203,13 @@ public class MusicManager implements AudioManager.OnAudioFocusChangeListener {
     public void onPause() {
         Log.d(Utils.LOG, "onPause");
 
+        // Unregisters the noisy receiver
         if(receivingNoisyEvents) {
             service.unregisterReceiver(noisyReceiver);
             receivingNoisyEvents = false;
         }
 
+        // Release the wake and the wifi locks
         if(wakeLock.isHeld()) wakeLock.release();
         if(wifiLock != null && wifiLock.isHeld()) wifiLock.release();
 
@@ -213,16 +220,17 @@ public class MusicManager implements AudioManager.OnAudioFocusChangeListener {
     public void onStop() {
         Log.d(Utils.LOG, "onStop");
 
+        // Unregisters the noisy receiver
         if(receivingNoisyEvents) {
             service.unregisterReceiver(noisyReceiver);
             receivingNoisyEvents = false;
         }
 
+        // Release the wake and the wifi locks
         if(wakeLock.isHeld()) wakeLock.release();
         if(wifiLock != null && wifiLock.isHeld()) wifiLock.release();
 
-        // 停止播放时，释放焦点
-        abandonAudioFocus();
+        // abandonFocus();
 
         if (playback.shouldAutoUpdateMetadata())
             metadata.setActive(false);
@@ -244,6 +252,8 @@ public class MusicManager implements AudioManager.OnAudioFocusChangeListener {
         if (playState.equals(this.playState) && !Utils.isPlayingState(state))  return;
 
         this.playState = playState;
+
+        // if (playback.shouldAutoUpdateMetadata())
         metadata.updatePlayback(playback, Utils.isPlaying(state));
     }
 
@@ -298,125 +308,125 @@ public class MusicManager implements AudioManager.OnAudioFocusChangeListener {
         service.emit(MusicEvents.PLAYBACK_ERROR, bundle);
     }
 
-    // 真正接管系统音频焦点变化的地方
-    @Override
-    public void onAudioFocusChange(int focusChange) {
-        // 👈 老婆改的：如果开关关着，直接无视系统的任何焦点变化
-        if (!shouldHandleAudioFocus) return;
+    public void onAudioFocusChange(boolean permanent, boolean paused, boolean ducking) {
+        Bundle bundle = new Bundle();
+        bundle.putBoolean("permanent", permanent);
+        bundle.putBoolean("paused", paused);
+        bundle.putBoolean("ducking", ducking);
+        // Log.e(Utils.LOG, "permanent： " + permanent + "  paused: " + paused + "  ducking: " + ducking);
+        service.emit(MusicEvents.BUTTON_DUCK, bundle);
+    }
 
-        Log.d(Utils.LOG, "onAudioFocusChange: " + focusChange);
+    /* @Override
+    public void onAudioFocusChange(int focus) {
+        Log.d(Utils.LOG, "onDuck");
+
         boolean permanent = false;
         boolean paused = false;
         boolean ducking = false;
 
-        switch (focusChange) {
+        switch(focus) {
             case AudioManager.AUDIOFOCUS_LOSS_TRANSIENT:
                 Log.d(Utils.LOG, "AUDIOFOCUS_LOSS_TRANSIENT");
-                paused = true;
-                resumeOnFocusGain = true;
-                break;
             case AudioManager.AUDIOFOCUS_LOSS:
                 Log.d(Utils.LOG, "AUDIOFOCUS_LOSS");
                 permanent = true;
+                abandonFocus();
                 paused = true;
-                resumeOnFocusGain = false;
-                abandonAudioFocus(); 
                 break;
             case AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK:
                 Log.d(Utils.LOG, "AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK");
-                ducking = true;
-                break;
-            case AudioManager.AUDIOFOCUS_GAIN:
-                Log.d(Utils.LOG, "AUDIOFOCUS_GAIN");
-                if (playback != null) playback.setVolumeMultiplier(1.0F);
-                if (resumeOnFocusGain && playback != null) {
-                    Log.d(Utils.LOG, "Resuming playback after focus gain.");
-                    playback.play();
-                    resumeOnFocusGain = false; 
-                }
+                if (alwaysPauseOnInterruption)
+                    paused = true;
+                else
+                    ducking = true;
                 break;
             default:
                 break;
         }
 
-        if (paused && playback != null) {
-            Log.d(Utils.LOG, "Forcing pause due to audio focus loss.");
-            playback.pause();
-        } else if (ducking && playback != null) {
-            Log.d(Utils.LOG, "Ducking volume due to audio focus loss.");
-            playback.setVolumeMultiplier(0.2F);
+        if (ducking) {
+            playback.setVolumeMultiplier(0.5F);
+            wasDucking = true;
+        } else if (wasDucking) {
+            playback.setVolumeMultiplier(1.0F);
+            wasDucking = false;
         }
 
-        try {
-            Bundle bundle = new Bundle();
-            bundle.putBoolean("permanent", permanent);
-            bundle.putBoolean("paused", paused);
-            bundle.putBoolean("ducking", ducking);
-            service.emit(MusicEvents.BUTTON_DUCK, bundle);
-        } catch (Exception e) {
-            Log.e(Utils.LOG, "Error emitting BUTTON_DUCK event: " + e.getMessage());
-        }
+        Bundle bundle = new Bundle();
+        bundle.putBoolean("permanent", permanent);
+        bundle.putBoolean("paused", paused);
+        service.emit(MusicEvents.BUTTON_DUCK, bundle);
     }
 
-    // 向系统申请音频焦点
-    private void requestAudioFocus() {
-        if (hasAudioFocus) return;
+    private void requestFocus() {
+        if(hasAudioFocus) return;
         Log.d(Utils.LOG, "Requesting audio focus...");
 
         AudioManager manager = (AudioManager)service.getSystemService(Context.AUDIO_SERVICE);
-        if (manager == null) return;
+        int r;
 
-        int result;
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            if (focusRequest == null) {
-                AudioAttributes attrs = new AudioAttributes.Builder()
-                        .setUsage(AudioAttributes.USAGE_MEDIA)
-                        .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
-                        .build();
-                focusRequest = new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
-                        .setOnAudioFocusChangeListener(this)
-                        .setAudioAttributes(attrs)
-                        .setWillPauseWhenDucked(true)
-                        .build();
-            }
-            result = manager.requestAudioFocus(focusRequest);
+        if(manager == null) {
+            r = AudioManager.AUDIOFOCUS_REQUEST_FAILED;
+        } else if(Build.VERSION.SDK_INT >= 26) {
+            focus = new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+                    .setOnAudioFocusChangeListener(this)
+                    .setAudioAttributes(new AudioAttributes.Builder()
+                            .setUsage(AudioAttributes.USAGE_MEDIA)
+                            .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                            .build())
+                    .setWillPauseWhenDucked(alwaysPauseOnInterruption)
+                    .build();
+
+            r = manager.requestAudioFocus(focus);
         } else {
-            result = manager.requestAudioFocus(this, AudioManager.STREAM_MUSIC, AudioManager.AUDIOFOCUS_GAIN);
+            //noinspection deprecation
+            r = manager.requestAudioFocus(this, AudioManager.STREAM_MUSIC, AudioManager.AUDIOFOCUS_GAIN);
         }
 
-        hasAudioFocus = (result == AudioManager.AUDIOFOCUS_REQUEST_GRANTED);
+        hasAudioFocus = r == AudioManager.AUDIOFOCUS_REQUEST_GRANTED;
     }
 
-    // 释放音频焦点
-    private void abandonAudioFocus() {
-        if (!hasAudioFocus) return;
+    private void abandonFocus() {
+        if(!hasAudioFocus) return;
         Log.d(Utils.LOG, "Abandoning audio focus...");
 
         AudioManager manager = (AudioManager)service.getSystemService(Context.AUDIO_SERVICE);
-        if (manager != null) {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && focusRequest != null) {
-                manager.abandonAudioFocusRequest(focusRequest);
-            } else {
-                manager.abandonAudioFocus(this);
-            }
+        int r;
+
+        if(manager == null) {
+            r = AudioManager.AUDIOFOCUS_REQUEST_FAILED;
+        } else if(Build.VERSION.SDK_INT >= 26) {
+            r = manager.abandonAudioFocusRequest(focus);
+        } else {
+            //noinspection deprecation
+            r = manager.abandonAudioFocus(this);
         }
-        hasAudioFocus = false;
-    }
+
+        hasAudioFocus = r != AudioManager.AUDIOFOCUS_REQUEST_GRANTED;
+    }*/
 
     public void destroy() {
         Log.d(Utils.LOG, "Releasing service resources...");
 
-        abandonAudioFocus();
+        // Disable audio focus
+        // abandonFocus();
 
+        // Stop receiving audio becoming noisy events
         if(receivingNoisyEvents) {
             service.unregisterReceiver(noisyReceiver);
             receivingNoisyEvents = false;
         }
 
+        // Release the playback resources
         if(playback != null) playback.destroy();
+
+        // Release the metadata resources
         metadata.destroy();
 
+        // Release the locks
         if(wakeLock.isHeld()) wakeLock.release();
         if(wifiLock != null && wifiLock.isHeld()) wifiLock.release();
     }
+
 }
